@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import gc
 import json
 import os
@@ -91,6 +97,209 @@ class _CheckpointerInterface(Protocol):
 
     def save_checkpoint(self, state_dict: Dict[str, Any], **kwargs) -> None:
         ...
+
+
+class FullModelTorchTuneCheckpointer(_CheckpointerInterface):
+    """
+    Checkpointer which reads and writes checkpoints in a format compatible with
+    torchtune. No conversion of weights is required.
+
+    Currently this supports reading a single checkpoint file only. This will likely change as
+    we add support for larger models.
+
+    Args:
+        checkpoint_dir (str): Directory containing the checkpoint files
+        checkpoint_files (List[str]): List of checkpoint files to load. Since the checkpointer takes care
+            of sorting by file ID, the order in this list does not matter
+        model_type (str): Model type of the model for which the checkpointer is being loaded
+        output_dir (str): Directory to save the checkpoint files
+        adapter_checkpoint (Optional[str]): Path to the adapter weights. Default is None
+        recipe_checkpoint (Optional[str]): Path to the recipe state checkpoint file. Default is None
+        resume_from_checkpoint (bool): If True, the checkpointer will load the additional checkpoint files to
+            resume training from a previous run. Default is False
+
+    Raises:
+        ValueError: If more than one checkpoint file is provided
+        ValueError: If the checkpoint file does not have a .pt extension
+        ValueError: If ``resume_from_checkpoint`` is True but ``recipe_checkpoint`` is None
+
+
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        checkpoint_files: List[str],
+        model_type: str,
+        output_dir: str,
+        adapter_checkpoint: Optional[str] = None,
+        recipe_checkpoint: Optional[str] = None,
+        resume_from_checkpoint: bool = False,
+    ) -> None:
+        # Fail fast if ``checkpoint_files`` is invalid
+        if len(checkpoint_files) != 1:
+            raise ValueError(
+                "Currently we only support reading from a single torchtune checkpoint file. "
+                f"Got {len(checkpoint_files)} files instead."
+            )
+
+        self._checkpoint_dir = Path(checkpoint_dir)
+        self._checkpoint_path = get_path(self._checkpoint_dir, checkpoint_files[0])
+
+        if not self._checkpoint_path.suffix == ".pt":
+            raise ValueError(
+                f"Checkpoint file {self._checkpoint_path} is not a valid checkpoint file. "
+                "Checkpointer expects a valid .pt file."
+            )
+
+        self._adapter_checkpoint = (
+            get_path(self._checkpoint_dir, adapter_checkpoint)
+            if adapter_checkpoint
+            else None
+        )
+
+        self._resume_from_checkpoint = resume_from_checkpoint
+        self._model_type = ModelType[model_type]
+        self._output_dir = Path(output_dir)
+
+        # recipe_checkpoint contains the recipe state. This should be available if
+        # resume_from_checkpoint is True
+        self._recipe_checkpoint = None
+        if self._resume_from_checkpoint:
+            if recipe_checkpoint is None:
+                raise ValueError(
+                    "If resume_from_checkpoint is True, recipe_checkpoint file must be provided."
+                )
+            self._recipe_checkpoint = get_path(self._checkpoint_dir, recipe_checkpoint)
+
+    def load_checkpoint(self, weights_only: bool = True) -> Dict[str, Any]:
+        """
+        Load torchtune checkpoint from file. Currently only loading from a single file is supported.
+
+        The output state_dict has the following format, with keys other than "model" only present if
+        ``resume_from_checkpoint`` is True:
+
+        >>>     {
+        >>>         "model": {
+        >>>             "key_1": weight
+        >>>             ...
+        >>>         },
+        >>>         "optimizer": {...},
+        >>>         ...
+        >>>     }
+
+        Args:
+            weights_only (bool): flag passed down to torch.load. We expose this, because quantized models
+                cannot be loaded with weights_only=True
+
+        Returns:
+            Dict[str, Any]: state_dict from the input checkpoint
+        """
+        state_dict: Dict[str:Any] = {}
+        state_dict[training.MODEL_KEY] = safe_torch_load(
+            self._checkpoint_path, weights_only=weights_only
+        )
+
+        if self._adapter_checkpoint:
+            adapter_state_dict = safe_torch_load(self._adapter_checkpoint)
+            state_dict[training.ADAPTER_KEY] = adapter_state_dict
+
+        if self._resume_from_checkpoint:
+            recipe_state = safe_torch_load(self._recipe_checkpoint, mmap=False)
+            state_dict.update(recipe_state)
+        return state_dict
+
+    def save_checkpoint(
+        self,
+        state_dict: Dict[str, Any],
+        epoch: int,
+        intermediate_checkpoint: bool = False,
+        adapter_only: bool = False,
+    ) -> None:
+        """
+        Save torchtune checkpoint to file. If ``intermediate_checkpoint`` is True, an additional
+        checkpoint file ``recipe_state.pt`` is created in ``_output_dir`` which contains the recipe
+        state. The output state dicts have the following formats:
+
+        >>> # Model
+        >>> {
+        >>>     "key_1": weight
+        >>>     ...
+        >>> }
+        >>>
+        >>> # Recipe state
+        >>> {
+        >>>     "optimizer": ...,
+        >>>     "epoch": ...,
+        >>>     ...
+        >>> }
+
+        Args:
+            state_dict (Dict[str, Any]): State dict with model and (optionally) recipe state
+            epoch (int): Current epoch number. This is added to the checkpoint file name to ensure
+                we're not overwriting intermediate checkpoint files
+            intermediate_checkpoint (bool): If True, save an additional checkpoint file with the
+                recipe state
+            adapter_only (bool): If True, only save the adapter weights. Default is False
+
+
+        Raises:
+            ValueError: if ``adapter_only`` is True and adapter checkpoint not found in state_dict.
+        """
+        self._output_dir.mkdir(exist_ok=True)
+
+        # Output file is always a .pt file with the epoch number in the name
+        if not adapter_only:
+            checkpoint_file = Path.joinpath(
+                self._output_dir, f"torchtune_model_{epoch}"
+            ).with_suffix(".pt")
+            torch.save(state_dict[training.MODEL_KEY], checkpoint_file)
+            logger.info(
+                "Model checkpoint of size "
+                f"{os.path.getsize(checkpoint_file) / 1000**3:.2f} GB "
+                f"saved to {checkpoint_file}"
+            )
+
+        if training.ADAPTER_KEY in state_dict:
+            output_path = Path.joinpath(
+                self._output_dir, f"adapter_{epoch}"
+            ).with_suffix(".pt")
+            torch.save(state_dict[training.ADAPTER_KEY], output_path)
+            logger.info(
+                "Adapter checkpoint of size "
+                f"{os.path.getsize(output_path) / 1000**3:.2f} GB "
+                f"saved to {output_path}"
+            )
+        elif adapter_only:
+            raise ValueError(
+                "Adapter checkpoint not found in state_dict. Please ensure that the state_dict contains adapter weights."
+            )
+
+        # If the recipe state needs to be output, first remove the model state dict
+        if intermediate_checkpoint:
+            _ = state_dict.pop(training.MODEL_KEY, None)
+            _ = state_dict.pop(training.ADAPTER_KEY, None)
+            _ = state_dict.pop(training.ADAPTER_CONFIG, None)
+            output_path = Path.joinpath(self._output_dir, "recipe_state.pt")
+            torch.save(state_dict, output_path)
+            logger.info(
+                "Recipe checkpoint of size "
+                f"{os.path.getsize(output_path) / 1000**3:.2f} GB "
+                f"saved to {output_path}"
+            )
+        else:
+            logger.info("Saving final epoch checkpoint.")
+            if adapter_only:
+                logger.info(
+                    "Please note that you have set adapter_only=True, so only adapter weights will be saved."
+                    "You need to merge the adapter weights into your base model for further use. "
+                    f"See {self.__class__.__name__}.save_checkpoint for more details."
+                )
+            else:
+                logger.info(
+                    "The full model checkpoint, including all weights and configurations, has been saved successfully."
+                    "You can now use this checkpoint for further training or inference."
+                )
 
 
 class FullModelHFCheckpointer(_CheckpointerInterface):
